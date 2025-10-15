@@ -21,24 +21,45 @@ A lightweight multimodal model combining GPT-2 and Vision Transformer for image 
 - **Final Loss**: 2.632
 - **Strategy**: Freeze pretrained models, train only cross-attention layers
 
-## 🚀 Quick Start
+## 🖼️ Example Results
 
-```bash
-# Install dependencies
-pip install torch torchvision transformers pillow
-
-# Load model
-from huggingface_hub import hf_hub_download
-checkpoint = hf_hub_download(
-    repo_id="gurumurthy3/vision-gpt-flickr8k",
-    filename="model_fp32/model_checkpoint.pth"
-)
-```
+<table>
+  <tr>
+    <td align="center">
+      <img src="examples/example1.png" height="225px" width="250px" alt="Example 1"/>
+      <br/>
+      <em>"A man is riding a motorbike on a scenic road."</em>
+    </td>
+    <td align="center">
+      <img src="examples/example2.png" height="225px" width="250px" alt="Example 2"/>
+      <br/>
+      <em>"a black race car running on a track"</em>
+    </td>
+    <td align="center">
+      <img src="examples/example3.png" height="225px" width="250px" alt="Example 3"/>
+      <br/>
+      <em>"The German shepherd dog is walking in the grass."</em>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="examples/example4.png" height="225px" width="250px" alt="Example 4"/>
+      <br/>
+      <em>"Three people stand near a group of trees."</em>
+    </td>
+    <td align="center">
+      <img src="examples/example5.png" height="225px" width="250px" alt="Example 5"/>
+      <br/>
+      <em>"A soccer player in red stands in the stands and looks up."</em>
+    </td>
+    <td align="center">
+      <img src="examples/example6.png" height="225px" width="250px" alt="Example 6"/>
+      <br/>
+      <em>"The two dogs play in the snow."</em>
+    </td>
+  </tr>
+</table>
 
 ## 🎨 Demo
 
 Try it on Hugging Face Spaces: [Multimodal GPT-2 Demo](https://huggingface.co/spaces/gurumurthy3/Multimodal-Gpt2-Demo)
-
-## 📝 Citation
-
-Inspired by the sparse cross-attention approach from Meta's Llama 3.2 Vision paper.
