@@ -1,145 +1,86 @@
-# GPT-2 + Vision (1-Stage On-the-Fly VLM Architecture Specification)
+# Multimodal GPT-2 — Version 2 (GPT2VL / Stackformer V2)
 
-This document outlines the **1-Stage neural network architecture, layer dimensions, parameter counts, dataflow, and training specification** for **GPT2VL** featuring:
-- **1-Stage On-the-Fly Feature Extraction**: Frozen ViT-B/16 vision encoder processing raw image batches dynamically (0 disk feature cache footprint).
-- **Trainable Multimodal Adapter**: **Perceiver Resampler** (64 latent tokens, 2 layers, 8 heads) + **Gated Sparse Cross-Attention** (spliced before GPT-2 layers 3, 6, 9) + **GPT-2 Small** language backbone.
-- **Exact Resumable Checkpointing**: Seamless pause & resume with exact batch-level DataLoader fast-forwarding, full optimizer/scheduler/scaler state restoration, and RNG state recovery.
+This directory contains **Version 2 (V2)** of **GPT2VL**, a 1-Stage On-the-Fly Vision-Language Model built with modular Object-Oriented design, gated cross-attention fusion, and comprehensive numerical stability safeguards for NVIDIA T4 GPUs.
 
 ---
 
-## 1. Executive Summary & Parameter Overview
+## 🎯 Key Architectural Innovations in V2
 
-The **GPT2VL** model uses an on-the-fly multimodal pipeline to optimize training speed, VRAM efficiency, and disk space usage on Google Colab NVIDIA T4 GPUs:
+```
+Raw Image (224x224) ──► Frozen ViT-B/16 (FP16 On-The-Fly) ──► Patch Tokens (197 x 768)
+                                                                    │
+                                                           Perceiver Resampler (SF)
+                                                               (64 Latents, Depth 2)
+                                                                    │
+                                                            Visual Tokens (64 x 768)
+                                                                    │
+Text Tokens ──► GPT-2 Small (Stackformer, Frozen) ◄─── Gated Cross-Attn (alpha = 0.0 -> trainable)
+                                                              (Inserted at L3, L6, L9)
+                                                                    │
+                                                            LM Head Logits (50258)
+```
 
-1. **On-the-Fly ViT Vision Encoder**: ViT-B/16 processes RGB images into patch feature tensors `(B, 197, 768)` dynamically under FP16 mixed precision during training forward passes, eliminating disk storage bottlenecks.
-2. **Trainable Multimodal Adapter & Decoder**:
-   - **Perceiver Resampler**: 2 layers, 64 latent tokens, 8 attention heads (**Trainable**).
-   - **Gated Sparse Cross-Attention**: Spliced before GPT-2 layers 3, 6, and 9 with a learnable gate $\alpha$:
-     $$H_{\text{new}} = H + \alpha \cdot \text{CrossAttention}(\text{Norm}(H), \text{VisualContext})$$
-     $\alpha$ is initialized to `0.0` so cross-attention starts with zero disruption to pre-trained GPT-2 text generation.
-   - **GPT-2 Small Backbone**: FP16, frozen.
+1. **Gated Sparse Cross-Attention**: Cross-attention blocks inserted before GPT-2 layers 3, 6, and 9 incorporate a learnable gating parameter $\alpha$ initialized to `0.0`:
+   $$H_{\text{new}} = H + \alpha \cdot \text{Dropout}\big(\text{CrossAttn}(\text{LayerNorm}(H), \text{VisualContext})\big)$$
+   Starting $\alpha = 0.0$ guarantees **zero disruption** to pretrained GPT-2 language generation at step 0. $\alpha$ gradually adjusts as multimodal alignment trains (clamped to $[-1.0, 1.0]$).
+2. **1-Stage Dynamic Pipeline**: Raw images from `Trickxter/COCO2017-captions` are transformed and passed directly into frozen ViT-B/16 during training batch forward passes, eliminating disk feature cache footprint.
+3. **Modular Stackformer Integration**: Built on top of `Stackformer` primitives, supporting fused QKV projections ($2304 \times 768$) and modular layer structures.
+4. **FP32-Upcasted Normalization Fix**: Overwrites `LayerNorm` and `RMSNorm` to perform `mean`/`var`/`sqrt` reductions internally in `float32` before returning in `float16`. Prevents catastrophic `inf`/`NaN` loss explosion when deep GPT-2 residual activations exceed FP16's ~65,504 range.
 
-### Parameter Breakdown Summary
+---
 
-| Component | Layer / Module | Parameter Count | % of Total | Trainable Status |
+## 📊 Parameter Overview
+
+| Component | Layer / Module | Parameters | % Total | Status |
 | :--- | :--- | :--- | :--- | :--- |
 | **Vision Encoder** | Torchvision `vit_b_16` (ImageNet-1K) | 85,798,656 | 32.31% | **Frozen (On-the-Fly)** |
-| **Vision Projection** | *Implicit Identity / Direct* | 0 | 0.00% | N/A |
 | **Perceiver Resampler** | 64 Latents + 2 Blocks (Cross-Attn + FFN) | 9,506,304 | 3.58% | **TRAINABLE** |
-| **Gated Cross-Attention** | 3 Blocks (spliced before L3, L6, L9; +3 $\alpha$ gates) | 7,091,715 | 2.67% | **TRAINABLE** |
+| **Gated Cross-Attn** | 3 Blocks (before L3, L6, L9; +3 $\alpha$ gates) | 7,091,715 | 2.67% | **TRAINABLE** |
 | **GPT-2 Text Backbone** | Embeddings + 12 Decoder Blocks + LM Head | 163,119,592 | 61.44% | **Frozen** |
-| **Total Model Parameters** | | **265,516,267** | **100.00%** | |
-| **Total Trainable Parameters**| | **16,598,019** | **6.25%** | **Active** |
+| **Total Model** | | **265,516,267** | **100.00%** | |
+| **Trainable Total** | | **16,598,019** | **6.25%** | **Active** |
 
 ---
 
-## 2. 1-Stage On-the-Fly Pipeline Architecture & Dataflow
+## 📈 Dataset & Quantitative Evaluation Metrics
 
-```mermaid
-graph TD
-    HF["Hugging Face: Trickxter/COCO2017-captions"] -->|Dynamic DataLoader| Batch["Batch Images (B, 3, 224, 224) & Captions (B, L)"]
-    Batch -->|Frozen FP16 ViT| ViT["Torchvision ViT-B/16 Encoder"]
-    ViT -->|Patch Tokens (B, 197, 768)| Resampler["Perceiver Resampler (2 Blocks, 64 Latents)"]
-    Resampler --> VisualContext["Compressed Visual Tokens (B, 64, 768)"]
+* **Dataset**: `Trickxter/COCO2017-captions` (118,287 training images, 5,000 validation images).
+* **Held-Out Evaluation Split**: 1,000 images reserved deterministically (seed 42) for end-of-epoch quantitative metric tracking.
+* **Text Preprocessing**: Normalization via `unicodedata.normalize('NFKD')`, control char removal, whitespace collapsing, and `"a photo"` fallback.
+* **Hyperparameters**: Batch size 32, Grad Accumulation 2 (Effective Batch 64), `OneCycleLR` (max LR $1\times 10^{-4}$, 5% warmup), 10 Epochs (18,330 total steps).
 
-    Batch -->|Clean Captions| Emb["GPT-2 WTE + WPE (B, L, 768)"]
-    Emb --> L0_2["GPT-2 Blocks 0 - 2"]
-    VisualContext -. Gated Cross-Attn (alpha) .-> Cross3["Gated Cross-Attn Block (L3)"]
-    L0_2 --> Cross3
-    Cross3 --> L3_5["GPT-2 Blocks 3 - 5"]
-    VisualContext -. Gated Cross-Attn (alpha) .-> Cross6["Gated Cross-Attn Block (L6)"]
-    L3_5 --> Cross6
-    Cross6 --> L6_8["GPT-2 Blocks 6 - 8"]
-    VisualContext -. Gated Cross-Attn (alpha) .-> Cross9["Gated Cross-Attn Block (L9)"]
-    L6_8 --> Cross9
-    Cross9 --> L9_11["GPT-2 Blocks 9 - 11"]
-    L9_11 --> FinalNorm["Final LayerNorm"]
-    FinalNorm --> LMHead["LM Head Linear (768 -> 50258)"]
-    LMHead --> Logits["FP16 AMP CrossEntropyLoss"]
-```
+### End-of-Epoch Quantitative Evaluation Results
+
+| Epoch | Train Loss | Eval Loss | BLEU-1 | BLEU-2 | BLEU-3 | BLEU-4 | METEOR | Gating $\alpha$ [L3, L6, L9] |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **1** | 12.2966 | 2.7970 | 0.222 | 0.093 | 0.050 | 0.034 | 0.155 | `[0.0068, -0.0107, -0.0207]` |
+| **2** | 7.5842 | 2.5204 | 0.266 | 0.130 | 0.079 | 0.056 | 0.209 | `[0.0176, -0.0285, -0.0505]` |
+| **3** | 5.9370 | 2.3991 | 0.294 | 0.152 | 0.098 | 0.069 | 0.237 | `[0.0268, -0.0462, -0.0795]` |
+| **4** | 5.0872 | 2.3261 | 0.309 | 0.163 | 0.106 | 0.076 | 0.253 | `[0.0367, -0.0627, -0.1066]` |
+| **5** | 4.5624 | 2.2809 | 0.312 | 0.167 | 0.110 | 0.080 | 0.258 | `[0.0458, -0.0780, -0.1301]` |
+| **6** | 4.2035 | 2.2584 | 0.316 | 0.169 | 0.109 | 0.079 | 0.261 | `[0.0531, -0.0905, -0.1493]` |
+| **7** | 3.9418 | 2.2450 | 0.319 | 0.171 | 0.112 | 0.081 | 0.265 | `[0.0594, -0.0101, -0.1625]` |
+| **8** | 3.7420 | 2.2331 | 0.322 | 0.174 | 0.113 | 0.080 | 0.268 | `[0.0628, -0.1055, -0.1710]` |
+| **9** | 3.5851 | 2.2280 | **0.323** | **0.177** | **0.117** | **0.084** | **0.271** | `[0.0645, -0.1081, -0.1744]` |
+| **10** | **3.4590** | **2.2281** | **0.323** | **0.177** | 0.116 | 0.083 | **0.271** | `[0.0649, -0.1085, -0.1749]` |
 
 ---
 
-## 3. Dataset Preprocessing & Cleaning Rules
+## 🛠️ Object-Oriented Software Architecture
 
-* **Source Dataset**: `Trickxter/COCO2017-captions`
-  - Train: `Data/train-*.parquet` (37 files, 118,287 images)
-  - Validation: `Data/validation-*.parquet` (2 files, 5,000 images)
-* **Caption Normalization Rules**:
-  1. Unicode NFKD normalization (`unicodedata.normalize('NFKD', cap)`).
-  2. Non-printable & invalid character removal.
-  3. Collapse repeated whitespace (`re.sub(r'\s+', ' ', cap)`).
-  4. Strip leading & trailing spaces (`cap.strip()`).
+- `GPT2VL`: Full 1-Stage VLM module managing ViT encoder, Perceiver Resampler, Stackformer GPT-2, and gated cross-attention.
+- `OnTheFlyVisionTextDataset`: Handles dynamic image loading, unicode normalization, and batch collation.
+- `CheckpointManager`: Handles saving trainable weights in `safetensors` format, complete metadata/optimizer/scheduler/scaler/RNG states in PyTorch checkpoints, and automatic Google Drive syncing. Fast-forwards DataLoaders past processed batches upon resumption.
+- `GPT2VLTrainer`: Object-Oriented training loop with gradient unscaling, norm clipping, alpha parameter clamping, live progress monitoring, time budget exit (4.5 hours), and automatic end-of-epoch evaluation.
+- `CaptionEvaluator`: NLTK-based evaluator computing BLEU-1..4 and METEOR scores on greedy-decoded hypotheses.
 
 ---
 
-## 4. Detailed Layer Specifications
+## 🚀 How to Run
 
-### 4.1 Perceiver Resampler (`PerceiverResamplerSF`)
-* **Latent Parameter Tensor**: `self.latents` of shape `(64, 768)` $\implies 49,152$ params.
-* **Depth**: 2 blocks (`perceiver_depth = 2`, `perceiver_heads = 8`).
-* **Block Composition**:
-  - `norm_latent`: `LayerNormalization(768)` ($1,536$)
-  - `norm_media`: `LayerNormalization(768)` ($1,536$)
-  - `cross_attn`: `Cross_MultiHead_Attention(embed_dim=768, num_heads=8)` ($2,362,368$)
-  - `ffn_norms`: `LayerNormalization(768)` ($1,536$)
-  - `ffns`: `FF_GELU(embed_dim=768, hidden_dim=1536)` ($2,361,600$)
-* **Total Resampler Parameters**: $49,152 + 2 \times 4,728,576 = 9,506,304$ (**Trainable**).
-
-### 4.2 Gated Sparse Cross-Attention Blocks (`GatedSparseCrossAttnBlock`)
-* **Splicing Positions**: Spliced before GPT-2 decoder layers **3, 6, and 9**.
-* **Gating Formulation**:
-  $$H_{\text{new}} = H + \alpha \cdot \text{Dropout}\big(\text{CrossAttn}(\text{LayerNorm}(H), \text{VisualContext})\big)$$
-  - `alpha`: `nn.Parameter(torch.zeros(1))` $\implies$ Initialized to `0.0`.
-* **Total Parameters for 3 Gated Blocks**: $3 \times (1,536 + 2,362,368 + 1) = 7,091,715$ (**Trainable**).
-
----
-
-## 5. Hyperparameter Configuration (`CFG`)
-
-```python
-CFG = {
-    # Dataset & Paths
-    "dataset_name": "Trickxter/COCO2017-captions",
-    "checkpoint_dir": "./gpt2vl_checkpoints",
-    "gdrive_checkpoint_dir": "/content/drive/MyDrive/GPT2VL_Checkpoints",
-
-    # GPT-2 Small Text Backbone
-    "vocab_size": 50258,
-    "embed_dim": 768,
-    "num_layers": 12,
-    "num_heads": 12,
-    "hidden_dim": 3072,
-    "context_length": 128,
-    "dropout": 0.1,
-    "qkv_bias": True,
-
-    # Vision & Multimodal Gated Cross-Attn
-    "vision_dim": 768,
-    "cross_attention_pos": [3, 6, 9],
-    "num_visual_tokens": 64,    # 64 latent tokens
-    "perceiver_depth": 2,       # 2 perceiver layers
-    "perceiver_heads": 8,       # 8 perceiver heads
-
-    # Training Setup & Scheduler
-    "batch_size": 16,
-    "grad_accum_steps": 2,      # Effective batch size = 32
-    "learning_rate": 1e-4,
-    "min_learning_rate": 1e-6,
-    "warmup_pct": 0.05,         # 5% warmup steps
-    "weight_decay": 0.01,
-    "num_epochs": 10,
-    "time_budget_minutes": 270, # 4.5 hours max Colab budget
-    "amp_dtype": "fp16",        # T4 optimized FP16 mixed precision
-}
-```
-
----
-
-## 6. Checkpointing, Google Drive Sync & Exact Resumption
-
-To prevent loss from Google Colab session timeouts:
-1. **Model Weights**: Saved as `safetensors` format (`model_trainable.safetensors`).
-2. **Metadata & Training State**: Saved as `checkpoint_state.pt` (includes `optimizer`, `scheduler`, `scaler`, `step`, `epoch`, `loss_history`, `alpha_values`, `rng_torch`, `rng_cuda`, `rng_python`, `rng_numpy`).
-3. **Google Drive Sync**: Automatically copied to `/content/drive/MyDrive/GPT2VL_Checkpoints/` after every epoch or checkpoint step.
-4. **Exact Resumability**: On reload, the trainer restores weights and state dicts, calculates `start_batch_in_epoch = (start_step * grad_accum_steps) % steps_per_epoch`, and fast-forwards the DataLoader past completed batches in the epoch to resume execution seamlessly from the exact uncompleted batch.
+1. Open [`gpt2_vision_stackformer_v2_train.ipynb`](gpt2_vision_stackformer_v2_train.ipynb) in Google Colab (GPU runtime recommended, e.g., T4/V100/A100).
+2. Execute cells top-to-bottom:
+   - Cell 01 & 03 automatically clone `Stackformer` and apply the FP32-upcasted `Normalization.py` patch on disk.
+   - Cell 23 transfers pretrained GPT-2 weights into the Stackformer backbone and runs a **Backbone Sanity Check** verifying English completion ("The cat sat on the" $\rightarrow$ floor, bed, couch).
+   - Cell 27 launches training for 10 epochs. Checkpoints save locally to `./gpt2vl_checkpoints/` and sync to Google Drive.
+3. Cell 30 displays a 6-sample visual comparison grid showing Ground Truth (GT) vs Model Generated (Gen) captions.
