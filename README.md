@@ -47,18 +47,18 @@ This repository tracks the complete engineering evolution of the model from its 
 | Feature / Metric | [Version 1 (V1 Baseline)](v1/) | [Version 2 (V2 GPT2VL)](v2/) |
 | :--- | :--- | :--- |
 | **Language Backbone** | Custom PyTorch GPT-2 Small (124M, 12 layers, 12 heads) | Modular `Stackformer` GPT-2 Small with fused QKV linear projections ($2304 \times 768$) |
-| **Vision Encoder** | Torchvision `vit_b_16` (ImageNet-1K), frozen, 196 patch tokens | Torchvision `vit_b_16` (ImageNet-1K), frozen, 197 patch tokens (includes CLS token) |
+| **Vision Encoder** | Torchvision `vit_b_16` (ImageNet-1K), frozen, 196 patch tokens | OpenAI CLIP ViT-B/16 (`openai/clip-vit-base-patch16`), frozen, 197 patch tokens (includes CLS token) |
 | **Multimodal Resampler** | Custom `PerceiverResampler` (64 latents, depth 2, FFN hidden dim 256) | `PerceiverResamplerSF` using Stackformer primitives (64 latents, depth 2, FFN hidden dim 1536) |
-| **Cross-Attention Fusion** | Ungated standard residual: $x + \text{CrossAttn}(x)$ | **Gated Cross-Attention**: $H + \alpha \cdot \text{Dropout}(\text{CrossAttn}(H))$, $\alpha_0 = 0.0$ |
-| **Total Model Parameters** | 222,092,520 (222.09M) | 265,516,267 (265.52M) |
-| **Trainable Parameters** | 11,084,288 (11.08M / 5.0%) | 16,598,019 (16.60M / 6.25%) |
-| **Training Dataset** | Flickr8k (8,000 images, 40,000 text captions) | `Trickxter/COCO2017-captions` (118,287 training images) |
+| **Cross-Attention Fusion** | Ungated standard residual: $x + \text{CrossAttn}(x)$ | **Gated Cross-Attention**: $H + \tanh(\alpha) \cdot \text{Dropout}(\text{CrossAttn}(H))$, $\alpha_0 = 0.0$ at layers [0, 4, 8] |
+| **Total Model Parameters** | 222,092,520 (222.09M) | 276,561,408 (276.56M) |
+| **Trainable Parameters** | 11,084,288 (11.08M / 5.0%) | 28,413,699 (28.41M / 10.27%) |
+| **Training Dataset** | Flickr8k (8,000 images, 40,000 text captions) | `AKCIT/coco2017-captioning` (118,287 training images, 586,748 5x-expanded pairs) |
 | **Caption Preprocessing** | Basic BOS/EOS tokenization, context length 256 | Strict Unicode NFKD cleaning, control char removal, whitespace collapse, `"a photo"` fallback, context length 128 |
-| **Training Pipeline** | FP32 standard PyTorch loop, 2 epochs, batch size 16, fixed LR ($1\times 10^{-4}$) | AMP FP16 mixed precision, 10 epochs (18,330 steps), effective batch size 64, `OneCycleLR` scheduler |
-| **Numerical Stability** | None | FP32-upcast LayerNorm math, grad clipping (`max_norm=1.0`), non-finite loss batch dropping, gating $\alpha$ bounds ($[-1.0, 1.0]$) |
+| **Training Pipeline** | FP32 standard PyTorch loop, 2 epochs, batch size 16, fixed LR ($1\times 10^{-4}$) | AMP FP16 mixed precision, FP32 LayerNorm math, dynamic batching, step fast-forward auto-resumption |
+| **Numerical Stability** | None | FP32-upcast LayerNorm math, grad clipping (`max_norm=1.0`), non-finite loss batch dropping, gating $\alpha$ bounds |
 | **State Persistence** | Basic end-of-run `torch.save` | `CheckpointManager` OO class (`safetensors` + `pt`), Google Drive auto-sync, exact batch fast-forwarding |
-| **Validation & Metrics** | Qualitative manual sampling (39 images) | Quantitative held-out 1,000-sample test set tracking **BLEU-1..4** & **METEOR** |
-| **Best Results** | Train Loss: **2.6757** | Train Loss: **3.4590** \| Eval Loss: **2.2281** \| **BLEU-1**: **0.323** \| **BLEU-4**: **0.083** \| **METEOR**: **0.271** |
+| **Validation & Metrics** | Qualitative manual sampling (39 images) | Quantitative full 5,000-image test set tracking **BLEU-1..4** & **METEOR** |
+| **Best Results** | Train Loss: **2.6757** | Train Loss: **2.3041** \| Eval Loss: **2.0513** \| **BLEU-1**: **0.6975** \| **BLEU-4**: **0.2362** \| **METEOR**: **0.4597** |
 
 ---
 
@@ -73,7 +73,7 @@ This repository tracks the complete engineering evolution of the model from its 
 │   └── examples/           <- Output caption samples (example1.png - example6.png)
 └── v2/                     <- Version 2 (COCO2017 1-Stage VLM, Stackformer, Gated Cross-Attn)
     ├── README.md           <- V2 architecture specifications, stability fixes, and eval tables
-    └── gpt2_vision_stackformer_v2_train.ipynb <- Object-Oriented V2 training & eval notebook
+    └── gpt2_vision_stackformer_v3_train.ipynb <- Unified V2 training, resumption & full 5k eval notebook
 ```
 
 ---
@@ -88,8 +88,8 @@ This repository tracks the complete engineering evolution of the model from its 
 
 ### Running Version 2 (V2 Gated VLM)
 1. Navigate to the [`v2/`](v2/) directory.
-2. Open [`gpt2_vision_stackformer_v2_train.ipynb`](v2/gpt2_vision_stackformer_v2_train.ipynb) in Google Colab (T4 GPU runtime recommended).
-3. Run all cells. The notebook automatically clones `Stackformer`, applies the FP32-upcast `Normalization.py` patch on disk, executes the **Backbone Sanity Check**, and trains on COCO 2017 for 10 epochs while logging BLEU/METEOR scores and saving checkpoints to `./gpt2vl_checkpoints/`.
+2. Open [`gpt2_vision_stackformer_v3_train.ipynb`](v2/gpt2_vision_stackformer_v3_train.ipynb) in Google Colab (T4 GPU runtime recommended).
+3. Run all cells. The notebook automatically installs dependencies, initializes CLIP ViT-B/16 + GPT-2 Small via Stackformer, trains/resumes training on COCO 2017, logs quantitative BLEU-1..4 / METEOR evaluation metrics, and saves checkpoints to `./gpt2vl_v3_checkpoints/`.
 
 ---
 
