@@ -90,6 +90,7 @@ This repository tracks the complete engineering evolution of the model from its 
 1. Navigate to the [`v2/`](v2/) directory.
 2. Open [`gpt2_vision_stackformer_v3_train.ipynb`](v2/gpt2_vision_stackformer_v3_train.ipynb) in Google Colab (T4 GPU runtime recommended).
 3. Run all cells. The notebook automatically installs dependencies, initializes CLIP ViT-B/16 + GPT-2 Small via Stackformer, trains/resumes training on COCO 2017, logs quantitative BLEU-1..4 / METEOR evaluation metrics, and saves checkpoints to `./gpt2vl_v3_checkpoints/`.
+4. Try the interactive Hugging Face demo: [gpt2vl-stackformer-v2](https://huggingface.co/spaces/gurumurthy3/gpt2vl-stackformer-v2).
 
 ---
 
